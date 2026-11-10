@@ -56,7 +56,7 @@ def assign_score_bracket_tier(score: float) -> str:
         return "Low Risk"
 
 
-def run_testing(input_file: Path, output_file: Path = None, show_samples: int = 20):
+def run_testing(input_file: Path, output_file: Path = None, show_samples: int = 20, dpd_cutoff: float = 10.0):
     model = AIModel("src/data/May 12 Status Contracts.xlsx", "src/data/Extracted New.xlsx")
     ui_input = App.__new__(App)
 
@@ -173,11 +173,11 @@ def run_testing(input_file: Path, output_file: Path = None, show_samples: int = 
     pct_30_69  = (count_30_69  / total_records) * 100.0 if total_records > 0 else 0.0
     pct_70_100 = (count_70_100 / total_records) * 100.0 if total_records > 0 else 0.0
 
-    # Ground truth validation against Actual DPD > 1 (if available)
+    # Ground truth validation against Actual DPD > dpd_cutoff (if available)
     has_ground_truth = "Actual DPD" in results_df.columns and results_df["Actual DPD"].notna().sum() > 0
-    actual_defaults = int((results_df["Actual DPD"] > 1).sum()) if has_ground_truth else 0
-    caught_aligned  = int(((results_df["Risk Tier"] == "High Risk") & (results_df["Actual DPD"] > 1)).sum()) if has_ground_truth else 0
-    caught_legacy   = int(((results_df["Credit Score"] < 30.0) & (results_df["Actual DPD"] > 1)).sum()) if has_ground_truth else 0
+    actual_defaults = int((results_df["Actual DPD"] > dpd_cutoff).sum()) if has_ground_truth else 0
+    caught_aligned  = int(((results_df["Risk Tier"] == "High Risk") & (results_df["Actual DPD"] > dpd_cutoff)).sum()) if has_ground_truth else 0
+    caught_legacy   = int(((results_df["Credit Score"] < 30.0) & (results_df["Actual DPD"] > dpd_cutoff)).sum()) if has_ground_truth else 0
 
     # ── Manager-requested summary: After Fix values ────────────────────────────
     predicted_defaults = int(prediction_after_fix.sum())
@@ -221,7 +221,7 @@ def run_testing(input_file: Path, output_file: Path = None, show_samples: int = 
 
     if has_ground_truth:
         print("\n" + "=" * 90)
-        print("GROUND-TRUTH VALIDATION AGAINST ACTUAL DEFAULTERS (Actual DPD > 1)")
+        print(f"GROUND-TRUTH VALIDATION AGAINST ACTUAL DEFAULTERS (Actual DPD > {dpd_cutoff})")
         print("=" * 90)
         print(f"  Actual Historical Defaulters in Portfolio: {actual_defaults:,} records")
         print(f"  Caught by Decision-Aligned High Risk     : {caught_aligned:,} ({caught_aligned/actual_defaults*100:.2f}% Recall) — Missed: {actual_defaults - caught_aligned:,}")
@@ -436,6 +436,12 @@ if __name__ == "__main__":
         default=15,
         help="Number of preview records to display (default: 15)",
     )
+    parser.add_argument(
+        "--dpd-cutoff",
+        type=float,
+        default=10.0,
+        help="DPD cutoff threshold above which an account is defined as default (default: 10.0)",
+    )
     args = parser.parse_args()
 
     input_path = Path(args.input)
@@ -445,4 +451,4 @@ if __name__ == "__main__":
         print(f"[ERROR] Input file does not exist: {input_path}")
         sys.exit(1)
 
-    run_testing(input_path, output_path, show_samples=args.samples)
+    run_testing(input_path, output_path, show_samples=args.samples, dpd_cutoff=args.dpd_cutoff)

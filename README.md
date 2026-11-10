@@ -1,106 +1,182 @@
-# JACCS Credit Scoring System
+# JACCS Credit Scoring System (v2.0.0 Production Release)
 
-A desktop credit-scoring application built with Python and Tkinter.
+Enterprise desktop credit risk assessment and credit scoring platform built with Python, Tkinter, LightGBM, and SHAP.
 
-## Project Overview
+---
 
-This project provides a credit scoring workflow for JACCS-style loan evaluation, including:
-
-- User authentication
-- Admin dashboard access
-- Credit scoring workflow
-- AI model loading and scoring
-- Local SQLite-backed data handling
-
-## Project Structure
+## 🏛️ System Architecture
 
 ```text
-credit-scoring-app/
-├── src/
-│   ├── backend/
-│   │   ├── ai_model.py
-│   │   ├── db.py
-│   │   ├── users.py
-│   │   ├── models/
-│   │   └── database/
-│   ├── frontend/
-│   │   ├── main.py
-│   │   ├── splash.py
-│   │   └── admin_dashboard.py
-│   └── data/
-│       ├── img/
-│       ├── Extracted New.xlsx
-│       └── May 12 Status Contracts.xlsx
-├── users.csv
-├── README.md
-├── ltid_logo(1).ico
-├── .venv/
-└── output/
+┌─────────────────────────────────────────────────────────────────────────┐
+│                           PRESENTATION LAYER                            │
+│  ┌──────────────┐   ┌─────────────────┐   ┌──────────────────────────┐  │
+│  │  Splash View │   │  Authentication │   │  Admin Dashboard View    │  │
+│  │ (splash.py)  │   │   (main.py)     │   │   (admin_dashboard.py)   │  │
+│  └──────┬───────┘   └────────┬────────┘   └────────────┬─────────────┘  │
+│         │                    │                         │                │
+│  ┌──────┴────────────────────┴─────────────────────────┴─────────────┐  │
+│  │                   Credit Scoring Application                      │  │
+│  │       • Single Assessment & Inline Feature Editor                 │  │
+│  │       • Batch Inference Engine (CSV/Excel Upload)                 │  │
+│  │       • Visual Risk Gauge (risk_gauge.py)                         │  │
+│  │       • Multi-sheet Detailed Export (export_manager.py)           │  │
+│  │       • Interactive SHAP Feature Contribution Explorer            │  │
+│  └───────────────────────────────────┬───────────────────────────────┘  │
+└──────────────────────────────────────┼──────────────────────────────────┘
+                                       │
+┌──────────────────────────────────────┴──────────────────────────────────┐
+│                         CORE BACKEND & ML ENGINE                        │
+│  ┌────────────────────────┐  ┌────────────────┐  ┌───────────────────┐  │
+│  │    AIModel (LightGBM)  │  │ User Security  │  │ Database Layer    │  │
+│  │ • Two-Stage Delinquency│  │ • SQLite Store │  │ • Connection Pool │  │
+│  │ • Policy Hazard Layer  │  │ • bcrypt/PBKDF2│  │ • Auto-Retry &    │  │
+│  │ • Calibrated Classifier│  │ • Rate Limiting│  │   Timeout Control │  │
+│  │ • SHAP TreeExplainer   │  │ • Audit Log    │  │ • SQL Server /    │  │
+│  │   (ai_model.py)        │  │   (users.py)   │  │   Offline Fallback│  │
+│  └────────────────────────┘  └────────────────┘  │     (db.py)       │  │
+│                                                  └───────────────────┘  │
+│  ┌────────────────────────┐  ┌────────────────┐  ┌───────────────────┐  │
+│  │ Health Check Monitor   │  │ Central Logger │  │ App Configuration │  │
+│  │  (health.py)           │  │  (logger.py)   │  │   (config.py)     │  │
+│  └────────────────────────┘  └────────────────┘  └───────────────────┘  │
+└─────────────────────────────────────────────────────────────────────────┘
 ```
 
-## Requirements
+---
 
-Use the project virtual environment and install dependencies from the project requirements file:
+## ✨ Features & Production Enhancements
+
+1. **Robust Dual-Mode Prediction Engine**:
+   - Single applicant scoring with real-time UI normalization and interactive inline editing.
+   - High-throughput batch assessment supporting both Excel (`.xlsx`, `.xls`) and CSV files with tokenization and encoding self-healing.
+   - Delinquency severity estimation & DPD classification alongside raw calibrated default probabilities.
+
+2. **Hardened Multi-Tenant Security & Authentication**:
+   - SQLite user credentials store with concurrent write-safety via WAL journal mode.
+   - Modern adaptive password hashing (`bcrypt` with fallback to `PBKDF2-HMAC-SHA256`).
+   - Anti-brute-force rate limiting (3 failed attempts triggers automatic 30s lockout per account).
+   - Tamper-evident rotating audit trail (`audit.log`).
+
+3. **Enterprise Connectivity & Resiliency**:
+   - Resilient database connection caching and active connection health probing.
+   - Exponential backoff retry logic (up to 3 attempts with timeout handling).
+   - Seamless offline fallback to bundled local datasets (`src/data/Extracted New.csv`) when SQL Server is unreachable.
+
+4. **Explainable AI (XAI)**:
+   - Integrated TreeSHAP breakdown showing positive/negative impact factors per borrower.
+   - Comprehensive multi-tab Excel reports featuring summary scorecards and granular SHAP driver tabs.
+
+5. **Operational Health & Diagnostics**:
+   - Centralized environment configuration via `config.py` and `.env`.
+   - Comprehensive health diagnostic suite (`health_check()`) verifying dataset integrity, model cache validity, and database status.
+
+---
+
+## 📋 Prerequisites
+
+- **Python**: Version 3.10+ (Recommended: Python 3.12 64-bit)
+- **ODBC Driver**: Microsoft ODBC Driver 17 or 18 for SQL Server (required only for live database connectivity)
+- **Operating System**: Windows 10/11 or Windows Server 2019+
+
+---
+
+## 🚀 Quick Start Guide
+
+### 1. Installation
+
+Clone or open the repository in PowerShell and execute:
 
 ```powershell
-cd D:\LTID\credit-scoring-app
-.\.venv\Scripts\Activate.ps1
-pip install -r src\requirements.txt
+# Using the production runner script
+.\run.ps1 setup
 ```
 
-## Run the app
+Or manually:
 
 ```powershell
-cd D:\LTID\credit-scoring-app
+python -m venv .venv
 .\.venv\Scripts\Activate.ps1
+pip install --upgrade pip
+pip install -r requirements.txt
+```
+
+### 2. Environment Configuration
+
+Copy `.env.example` to `.env` or set environment variables in your active shell:
+
+```powershell
+# Set initial admin credentials (optional - randomly generated if omitted)
+$env:JACCS_DEFAULT_ADMIN_PASSWORD = "YourSecurePassword123!"
+
+# Configure database server (optional)
+$env:SQL_SERVER = "YOUR_SERVER\SQLEXPRESS"
+
+# Set logging verbosity (DEBUG, INFO, WARNING, ERROR)
+$env:JACCS_LOG_LEVEL = "INFO"
+```
+
+### 3. Running the Application
+
+```powershell
+# Quick launcher
+.\run.ps1 run
+
+# Or via Python directly
 python src\frontend\main.py
 ```
 
-Before using database-backed features, configure the connection with
-`save_config()` or by editing `src\backend\data\database\db_config.json`.
-Credentials are intentionally not stored in this repository.
+### Default Credentials
+Upon first launch with clean storage:
+- **Email**: `admin@example.com`
+- **Password**: Set via `JACCS_DEFAULT_ADMIN_PASSWORD` (or view console output if not set)
 
-## Validate later-period performance
+---
 
-Evaluate predictions against rows with observed `Current DPD` in the later
-January–June 2026 dataset. A default is defined as `Current DPD > 1`; rows
-without an observed DPD are excluded. The evaluator reports precision, recall,
-F1-score, ROC-AUC, average precision, and the confusion matrix:
+## 🧪 Automated Test Suite
 
-```powershell
-python .\tests\evaluate_later_performance.py
-```
-
-The evaluator uses only customer application features for prediction and uses
-`Current DPD` only as the ground-truth label. Because the current later-period
-file contains very few non-default labels, interpret precision/recall and
-ROC-AUC together with the reported class counts. The model's decision
-threshold is selected on its validation split using recall-weighted F2-score,
-with a minimum precision guard; ROC-AUC continues to use the raw probabilities.
-
-## Build executable with PyInstaller
-
-Use the following command from the project root:
+The system includes 80+ unit and integration tests covering data transformations, underwriting logic, database resiliency, security, and ML pipelines.
 
 ```powershell
-pyinstaller --noconfirm --onefile --windowed --icon "D:\LTID\credit-scoring-app\ltid_logo(1).ico" --name "JACCSScore" --add-data "D:\LTID\credit-scoring-app\src;src/" --add-data "D:\LTID\credit-scoring-app\src\data\img;img" --add-data "D:\LTID\credit-scoring-app\src\backend\models\May 12 Status Contracts_Extracted New_lgbm.joblib;src/backend/models/" "D:\LTID\credit-scoring-app\src\frontend\main.py"
+# Run the full test suite
+.\run.ps1 test
+
+# Or run directly with pytest
+pytest tests/ -v
 ```
 
-## Notes
+---
 
-- The app expects project resources under the `src` folder and bundled image assets under `img` during packaged execution.
-- If the model file path changes, update the `--add-data` entry accordingly.
-- The built executable will be created inside the `dist` folder by default.
+## 📦 Building Standalone Executable (.exe)
 
-## Troubleshooting
+Package the application as a zero-dependency Windows desktop executable using PyInstaller:
 
-If the packaged app fails to launch:
+```powershell
+.\run.ps1 build
+```
 
-1. Confirm that all required data files still exist in the project.
-2. Confirm that the model file path in the PyInstaller command matches the actual file name.
-3. Confirm that the app is resolving files using the correct resource paths in the code.
-4. Rebuild after verifying the project structure.
+The compiled application will be generated in `dist/JACCSScore.exe`.
 
-## License
+---
 
-This project is for internal/local use and should be used according to your organization’s requirements.
+## 📁 System Logs & Storage Paths
+
+All persistent application data and logs are isolated in a user-safe directory:
+
+- **Logs**: `%USERPROFILE%\.jaccs_credit_app\logs\` (or fallback to `%TEMP%\jaccs_credit_app\logs\`)
+  - `app.log`: Application and operational events (10 MB rotating, 5 backups)
+  - `audit.log`: Security, authentication, and user administration events
+  - `predictions.log`: Audit trail of all scored borrowers and calculated credit decisions
+- **User Store**: `src/backend/users.db` / `%USERPROFILE%\.jaccs_credit_app\users.db`
+- **Database Config**: `src/data/database/db_config.json`
+
+---
+
+## ❓ Troubleshooting
+
+| Issue | Cause | Solution |
+| :--- | :--- | :--- |
+| **"Could not connect to database"** | SQL Server instance offline or ODBC driver missing | The app automatically falls back to local data. To connect to live DB, ensure ODBC Driver 17/18 is installed and verify connection in `Settings (⚙)`. |
+| **"User account temporarily locked"** | 3 consecutive failed login attempts | Wait 30 seconds for the rate-limiting lockout period to expire before retrying. |
+| **First run takes 3-5 minutes** | AI model is training and compiling LightGBM bundles | This occurs only once when training data changes. Subsequent launches load the precompiled `.joblib` cache in < 2 seconds. |
+| **XLSX export fails** | Missing `openpyxl` dependency | Verify installation with `pip install openpyxl>=3.1.0`. |
+| **Permission Denied on AppData** | Restricted corporate security sandbox | Set `$env:JACCS_APP_DIR = "C:\YourWritablePath"` before running. |

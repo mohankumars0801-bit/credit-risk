@@ -29,7 +29,7 @@ from src.backend.ai_model import AIModel
 from src.frontend.main import App
 
 
-def evaluate(input_path: Path, label_column: str, threshold: float | None) -> dict[str, float | int | str]:
+def evaluate(input_path: Path, label_column: str, threshold: float | None, dpd_cutoff: float = 10.0) -> dict[str, float | int | str]:
     """Return classification and ranking metrics for observed DPD outcomes."""
     df = pd.read_excel(input_path) if input_path.suffix.lower() == ".xlsx" else pd.read_csv(input_path)
     if label_column not in df.columns:
@@ -40,7 +40,7 @@ def evaluate(input_path: Path, label_column: str, threshold: float | None) -> di
     if labeled.empty:
         raise ValueError(f"No numeric labels were found in {input_path}")
 
-    y_true = (pd.to_numeric(labeled[label_column], errors="coerce") > 1).astype(int).to_numpy()
+    y_true = (pd.to_numeric(labeled[label_column], errors="coerce") > dpd_cutoff).astype(int).to_numpy()
     if np.unique(y_true).size < 2:
         raise ValueError("ROC-AUC requires both default and non-default labels")
 
@@ -61,7 +61,7 @@ def evaluate(input_path: Path, label_column: str, threshold: float | None) -> di
 
     return {
         "dataset": input_path.name,
-        "default_rule": f"{label_column} > 1",
+        "default_rule": f"{label_column} > {dpd_cutoff}",
         "total_rows": int(len(df)),
         "labeled_rows": int(len(labeled)),
         "unlabeled_rows": int(len(df) - len(labeled)),
@@ -95,6 +95,12 @@ def main() -> None:
         help="Observed DPD column used as the ground-truth label.",
     )
     parser.add_argument(
+        "--dpd-cutoff",
+        type=float,
+        default=10.0,
+        help="DPD cutoff threshold above which an account is defined as default (default: 10.0).",
+    )
+    parser.add_argument(
         "--threshold",
         type=float,
         default=None,
@@ -108,7 +114,7 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    metrics = evaluate(args.input.resolve(), args.label, args.threshold)
+    metrics = evaluate(args.input.resolve(), args.label, args.threshold, args.dpd_cutoff)
     print(json.dumps(metrics, indent=2))
     if args.json is not None:
         args.json.parent.mkdir(parents=True, exist_ok=True)

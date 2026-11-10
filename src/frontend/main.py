@@ -15,7 +15,10 @@ import threading
 from src.frontend.splash import Splash
 from src.backend.users import ensure_user_store, authenticate
 from src.frontend.admin_dashboard import AdminDashboard
+from src.backend.logger import get_logger, log_prediction
 import pandas as pd
+
+logger = get_logger(__name__)
 
 
 def read_csv_safe(path: str, **kwargs) -> pd.DataFrame:
@@ -888,6 +891,18 @@ class App(tk.Tk):
         credit_score = (1 - ai_pred) * 100.0
         if hasattr(self, "credit_var"):
             self.credit_var.set(f"{credit_score:.2f}")
+
+        # Audit log the prediction
+        try:
+            party_no = self.db_row.get("Party No") if self.db_row else None
+            app_no = self.db_row.get("Application No") if self.db_row else None
+            threshold = getattr(self.ai, "decision_threshold", 0.5)
+            log_prediction(party_no=party_no, app_no=app_no, probability=ai_pred,
+                           credit_score=credit_score, threshold=threshold)
+            logger.info("Scored customer party=%s, app=%s: prob=%.4f, score=%.2f",
+                        party_no, app_no, ai_pred, credit_score)
+        except Exception as log_err:
+            logger.warning("Failed to log prediction: %s", log_err)
 
         # Hide calculate button after prediction
         if hasattr(self, "btn_calculate"):

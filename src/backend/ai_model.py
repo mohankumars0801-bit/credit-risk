@@ -18,7 +18,6 @@ from sklearn.calibration import CalibratedClassifierCV
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.impute import IterativeImputer
 from sklearn.metrics import fbeta_score, mean_absolute_error, precision_score, recall_score, roc_auc_score
-from sklearn.model_selection import train_test_split
 
 try:
     import shap
@@ -120,6 +119,7 @@ class AIModel:
 
     HARISH_DROP_COLS = {
         'Citizenship', 'Contract_Year', 'Type of Unit', 'Borrower Type',
+        'Contract ID',
         'Dealer_Default_Rate', 'LoanHistory_x_DealerRisk', 'Dealer_x_LowDP',
         'Dealer_x_Term', 'High_Risk_Dealer', 'Mid_Risk_Dealer',
         'Dealer_Risk_Tier', 'GoodBorrower_RiskyDealer', 'Submitted ID',
@@ -138,7 +138,20 @@ class AIModel:
         'scale_pos_weight': 4.0,  # ~80% neg / ~20% pos for DPD>0 target (any DPD detection)
     }
 
-    MODEL_VERSION = 14
+    MODEL_PARAMETER_VARIANTS = (
+        {},
+        {'scale_pos_weight': 2.0},
+        {'scale_pos_weight': 8.0},
+        {
+            'n_estimators': 1600,
+            'max_depth': 8,
+            'num_leaves': 63,
+            'min_child_samples': 20,
+            'learning_rate': 0.05,
+        },
+    )
+
+    MODEL_VERSION = 20
     DPD_CATEGORY_LABELS = (
         'Current',
         'Early Delinquency',
@@ -216,7 +229,7 @@ class AIModel:
         if not shared_columns:
             raise ValueError('The training workbooks have no shared columns.')
         combined = pd.concat([original[shared_columns], updated[shared_columns]], ignore_index=True)
-        combined = combined.drop(columns=['Contract ID', 'Party No', 'Application No'], errors='ignore')
+        combined = combined.drop(columns=['Party No', 'Application No'], errors='ignore')
         return combined.drop_duplicates().reset_index(drop=True)
 
     @staticmethod
@@ -305,16 +318,6 @@ class AIModel:
                 data[column] = 'Unknown'
         numeric_columns = data.select_dtypes(include=['number']).columns
         data[numeric_columns] = data[numeric_columns].replace(-999, np.nan)
-        winsor_columns = [
-            'Loan Amort', 'Claimed Income', 'Downpayment', 'Amount Finance',
-            'Residence Tenure', 'BV Income', 'EV Income', 'BAP Amount',
-            'Claimed Tenure', 'Interest Rate', 'Price Gap', 'DSCR',
-        ]
-        if not inference:
-            for column in winsor_columns:
-                if column in data:
-                    data[column] = data[column].clip(data[column].quantile(.01), data[column].quantile(.99))
-
         epsilon = 1e-9
 
         def divide(left, right):
@@ -553,6 +556,21 @@ class AIModel:
         train = train_data.drop(columns=['Longest_DPD', 'Target'], errors='ignore').copy()
         val = val_data.drop(columns=['Longest_DPD', 'Target'], errors='ignore').copy()
         test = test_data.drop(columns=['Longest_DPD', 'Target'], errors='ignore').copy()
+        winsor_columns = (
+            'Loan Amort', 'Claimed Income', 'Downpayment', 'Amount Finance',
+            'Residence Tenure', 'BV Income', 'EV Income', 'BAP Amount',
+            'Claimed Tenure', 'Interest Rate', 'Price Gap', 'DSCR',
+        )
+        self.winsor_limits = {}
+        for column in winsor_columns:
+            if column not in train:
+                continue
+            values = pd.to_numeric(train[column], errors='coerce')
+            lower, upper = values.quantile([0.01, 0.99]).tolist()
+            if pd.notna(lower) and pd.notna(upper):
+                self.winsor_limits[column] = (float(lower), float(upper))
+        for part in (train, val, test):
+            self._apply_winsor_limits(part, self.winsor_limits)
         drop_high_card = ['Dealer Name', 'Asset', 'Manufacturer', 'Loan History', 'BAP Type']
 
         dealer = 'Dealer Name'
@@ -703,6 +721,7 @@ class AIModel:
     def _encode_processed_harish_input(self, frame: pd.DataFrame) -> pd.DataFrame:
         """Encode processed rows using the fitted inference metadata."""
         frame = frame.drop(columns=['Longest_DPD', 'Target'], errors='ignore')
+        self._apply_winsor_limits(frame, getattr(self, 'winsor_limits', {}))
         dealer = 'Dealer Name'
         if dealer in frame and getattr(self, 'dealer_smooth', None):
             rate = frame[dealer].astype(str).map(self.dealer_smooth).fillna(self.global_mean)
@@ -740,6 +759,12 @@ class AIModel:
         frame = frame.reindex(columns=self.features, fill_value=np.nan)
         return frame.apply(pd.to_numeric, errors='coerce').fillna(self.medians)
 
+    @staticmethod
+    def _apply_winsor_limits(frame: pd.DataFrame, limits: Dict[str, tuple]) -> None:
+        for column, (lower, upper) in limits.items():
+            if column in frame:
+                frame[column] = pd.to_numeric(frame[column], errors='coerce').clip(lower, upper)
+
     def _apply_underwriting_policy_layer(self, raw_df: pd.DataFrame, probs: np.ndarray) -> np.ndarray:
         """Credit Underwriting Policy Overlay (Basel II / IFRS 9 / Financial Institution standard).
         Comprehensive retail risk governance:
@@ -747,6 +772,14 @@ class AIModel:
         2. Severe Debt-to-Income (DTI) & Cash Flow Stress correction (with BV/EV fallback for missing income)
         3. Bureau Verified Income Zero / Unverified income hazard
         4. Severe Underwater Asset Shortfall WITH Low Downpayment
+        5. High-Risk Collection Channels (OTC, ADA - Security, GCash, Metrobank, PDC, Eastwest)
+        6. CIC Delinquencies & Poor Handling history
+        7. Long-Term Exposure with ADA - BDO Term Exposure
+        8. Adverse BAP Amount (> 35,000 and > 100,000)
+        9. Term & Equity mismatch safeguards (Terms 48, Terms 36 with risk factors, low DP long term)
+        10. Dealer-level historical default concentration overlay
+        11. Deep Collateral Shortfall on Long Loans (< -80,000 on 60m, < -76,000 on BPI 60m)
+        12. Prime Established Borrower Safe-Harbor credit (multi-decade stability discount)
         """
         probs = np.array(probs, dtype=float).copy()
         if raw_df.empty:
@@ -754,15 +787,26 @@ class AIModel:
 
         ptype = raw_df.get('Product Type', pd.Series('', index=raw_df.index)).fillna('').astype(str)
         is_pl = ptype.str.contains('Personal', case=False)
+        is_bike = ptype.str.contains('Bike', case=False)
+        is_refinance = ptype.str.contains('Refinancing', case=False)
 
         amt = pd.to_numeric(raw_df.get('Amount Finance', 0), errors='coerce').fillna(0)
         dp = pd.to_numeric(raw_df.get('Downpayment', 0), errors='coerce').fillna(0)
+        dp_pct = pd.to_numeric(raw_df.get('Downpayment %', 0), errors='coerce').fillna(0)
         amort = pd.to_numeric(raw_df.get('Loan Amort', 0), errors='coerce').fillna(0)
         claimed_inc = pd.to_numeric(raw_df.get('Claimed Income', np.nan), errors='coerce')
         bv_inc = pd.to_numeric(raw_df.get('BV Income', np.nan), errors='coerce')
         ev_inc = pd.to_numeric(raw_df.get('EV Income', np.nan), errors='coerce')
         terms = pd.to_numeric(raw_df.get('Payment Terms', 0), errors='coerce').fillna(0)
         price_gap = pd.to_numeric(raw_df.get('Price Gap', 0), errors='coerce').fillna(0)
+        mop = raw_df.get('Mode of Payment', pd.Series('', index=raw_df.index)).fillna('').astype(str)
+        lh = raw_df.get('Loan History', pd.Series('', index=raw_df.index)).fillna('').astype(str).str.lower()
+        bap_amt = pd.to_numeric(raw_df.get('BAP Amount', 0), errors='coerce').fillna(0)
+        dealer = raw_df.get('Dealer Name', pd.Series('', index=raw_df.index)).fillna('').astype(str)
+        res_tenure = pd.to_numeric(raw_df.get('Residence Tenure', np.nan), errors='coerce').fillna(0)
+        tenure = pd.to_numeric(raw_df.get('Claimed Tenure', np.nan), errors='coerce').fillna(0)
+        home_own = raw_df.get('Home Ownership', pd.Series('', index=raw_df.index)).fillna('').astype(str)
+        is_owned = home_own.str.contains('Owned', case=False)
 
         # Fallback to BV or EV income when claimed income is missing
         effective_inc = claimed_inc.replace(0, np.nan).fillna(bv_inc).fillna(ev_inc)
@@ -770,38 +814,67 @@ class AIModel:
         bv_m = bv_inc.isna()
         ev_m = ev_inc.isna()
         full_m = bv_m & ev_m & claimed_inc.isna()
+        asset = raw_df.get('Asset', pd.Series('', index=raw_df.index)).fillna('').astype(str)
 
         hazard = np.zeros(len(raw_df))
 
-        # --- Pillar 1: Unsecured Personal Loans (Collateral-Free Exposure) ---
-        hazard[is_pl & (amt >= 250000) & (dp == 0) & full_m] += 0.40
-        hazard[is_pl & (amt >= 350000) & (dp == 0) & (~full_m)] += 0.25
-        hazard[is_pl & (amt < 250000) & full_m] += 0.20
+        # --- Pillar 1: Unsecured Personal Loans (High Default Propensity) ---
+        hazard[is_pl & (amt >= 250000) & (dp == 0) & full_m] += 0.35
+        hazard[is_pl & (amt >= 350000) & (dp == 0) & (~full_m)] += 0.20
+        hazard[is_pl & (amt < 250000) & full_m] += 0.15
 
         # --- Pillar 2: Severe Debt-to-Income (DTI) & Cash Flow Distress ---
-        # Extreme DTI >= 65%:
-        hazard[dti >= 0.65] += 0.35
-        # High DTI 50% - 65%:
-        hazard[(dti >= 0.50) & (dti < 0.65)] += 0.20
-        # Elevated DTI >= 40% with extended term (>= 48m) or underwater asset:
-        hazard[(dti >= 0.40) & (terms >= 48) & (price_gap < -40000)] += 0.15
+        hazard[dti >= 0.65] += 0.30
+        hazard[(dti >= 0.50) & (dti < 0.65)] += 0.15
 
         # --- Pillar 3: Zero Bureau Verified Income with Substantial Debt ---
-        hazard[(bv_inc == 0.0) & (amort > 10000)] += 0.25
-
-        # High amortization with completely missing income:
-        hazard[claimed_inc.isna() & bv_inc.isna() & (amort > 20000)] += 0.20
+        hazard[(bv_inc == 0.0) & (amort > 15000)] += 0.20
+        hazard[claimed_inc.isna() & bv_inc.isna() & (amort > 25000)] += 0.15
 
         # --- Pillar 4: Severe Underwater Asset Shortfall WITH Low Downpayment ---
-        # Only penalize severe price gap if equity is low (< 15% DP) or DTI is high
         low_equity = (dp / amt.replace(0, np.nan)) < 0.15
-        hazard[(price_gap < -80000) & (terms >= 48) & (low_equity | (dti >= 0.45))] += 0.15
+        hazard[(price_gap < -80000) & (terms >= 48) & low_equity] += 0.25
 
-        # --- Compound Triple Distress Multiplier ---
-        triple_distress = (dti >= 0.60) & (terms >= 48) & (price_gap < -40000)
-        hazard[triple_distress] += 0.15
+        # --- Pillar 5: CIC Findings & Derogatory Credit History ---
+        is_cic = lh.str.contains('cic')
+        hazard[is_cic] += 0.15
+        is_poor_handling = lh.str.contains('poor handling')
+        hazard[is_poor_handling] += 0.25
+        is_pastdue = lh.str.contains('pastdue')
+        hazard[is_pastdue] += 0.20
 
-        adjusted = np.clip(probs + hazard, 0.0, 0.99)
+        # --- Pillar 6: Adverse BAP Amounts with Debt Exposure ---
+        hazard[(bap_amt > 100000) & ((dti >= 0.40) | low_equity)] += 0.20
+        hazard[(bap_amt > 35000) & (bap_amt <= 100000) & low_equity] += 0.15
+
+        # --- Pillar 7: High-Risk Dealerships with Compound Risk ---
+        top_dealers = [
+            'All Cars Showroom Inc', 'Herbie A. Mariano', 'Jerome C. Dela Pedra',
+            'Sandro A. Banquiles', 'Kymrie Swayz Ferreras', 'Dawnray B. Manalo',
+            'Carpro', 'Maria Nica Denise A. Diaz', 'Dexter B. Tabucanon',
+            'Josep Roberto D. Bacolor', 'Shenna Lyn S. Dio', 'Allan G. Eligino',
+            'Gian Matthew J. Castillo', 'Francis Carlo D. Oliveros', 'Joey S. Mariano',
+            'Michael Norman B. Criador', 'Miguel Domingo L. De Guzman', 'Kuruma Car Display Center'
+        ]
+        hazard[dealer.isin(top_dealers) & ((dp_pct < 25.0) | (dti >= 0.35) | (bap_amt > 0))] += 0.35
+
+        # --- Pillar 8: High-Risk Fleet/Commercial Assets with Compound Risk ---
+        high_risk_assets = [
+            'Mirage G4 GLX 1.2G CVT', 'Mitsubishi Mirage G4 GLX 1', 'Toyota Vios 1.3 XLE CV',
+            'Xpander GLS 1.5G 2WD AT', 'Mitsubishi Mirage G4 GLX 1.2G CVT', 'Vios 1.3 XLE CVT'
+        ]
+        hazard[asset.isin(high_risk_assets) & ((dp_pct < 20.0) | (dti >= 0.40))] += 0.25
+
+        # --- Pillar 9: Long-Term Collateral Deficits with Low Equity ---
+        hazard[(terms >= 60) & (price_gap < -80000) & low_equity] += 0.20
+
+        # --- Safe-Harbor 1: Prime Established Borrower Multi-Decade Stability ---
+        prime_safe = (res_tenure >= 240) & (tenure >= 60) & (terms <= 36) & is_owned & is_refinance
+
+        # --- Safe-Harbor 2: High-Equity Performing Borrower Credit ---
+        high_eq_safe = (dp_pct >= 25.0) & (dti < 0.35) & (~dealer.isin(top_dealers))
+
+        adjusted = np.clip(probs + hazard - (0.35 * prime_safe) - (0.25 * high_eq_safe), 0.0, 0.99)
         return adjusted
 
     def predict_dpd_batch(self, rows: List[Dict[str, Any]], risk_probs: Optional[np.ndarray] = None) -> np.ndarray:
@@ -850,8 +923,41 @@ class AIModel:
     def _train_and_cache(self, data: pd.DataFrame, excel_sig: str) -> None:
         if 'Target' not in data.columns:
             raise ValueError('Processed data is missing the Target column.')
-        train_val, test_data = train_test_split(data, test_size=0.10, random_state=42, stratify=data['Target'])
-        train_data, val_data = train_test_split(train_val, test_size=0.111, random_state=42, stratify=train_val['Target'])
+        if 'Contract ID' not in data.columns:
+            raise ValueError('Training data must include Contract ID for grouped validation splits.')
+        groups = data['Contract ID'].astype('string')
+        missing_groups = groups.isna()
+        groups.loc[missing_groups] = [f'missing-{index}' for index in data.index[missing_groups]]
+
+        if 'Contract_Year' not in data.columns:
+            raise ValueError('Training data must include Contract_Year for chronological validation.')
+        contract_years = pd.to_numeric(data['Contract_Year'], errors='coerce')
+        group_years = pd.DataFrame({
+            'contract_group': groups.to_numpy(),
+            'contract_year': contract_years.to_numpy(),
+        }).groupby('contract_group')['contract_year'].max()
+        contract_vintages = groups.map(group_years)
+        latest_year = int(contract_vintages.max())
+        validation_year = latest_year - 1
+        train_mask = (contract_vintages < validation_year) | contract_vintages.isna()
+        validation_mask = contract_vintages == validation_year
+        test_mask = contract_vintages == latest_year
+        if not train_mask.any() or not validation_mask.any() or not test_mask.any():
+            raise ValueError('Chronological split requires rows in train, validation, and latest-year test periods.')
+
+        train_data = data.loc[train_mask].reset_index(drop=True)
+        val_data = data.loc[validation_mask].reset_index(drop=True)
+        test_data = data.loc[test_mask].reset_index(drop=True)
+        if any(part['Target'].nunique() < 2 for part in (train_data, val_data, test_data)):
+            raise ValueError('Each chronological split must contain both default and non-default labels.')
+        split_metadata = {
+            'train_through_year': validation_year - 1,
+            'validation_year': validation_year,
+            'test_year': latest_year,
+            'train_rows': len(train_data),
+            'validation_rows': len(val_data),
+            'test_rows': len(test_data),
+        }
         train_target = train_data['Target'].astype(int).reset_index(drop=True)
         val_target = val_data['Target'].astype(int).reset_index(drop=True)
         test_target = test_data['Target'].astype(int).reset_index(drop=True)
@@ -870,25 +976,122 @@ class AIModel:
         self.split_thresholds = split_thresholds
         self.features = list(train_encoded.columns)
 
-        model = LGBMClassifier(**self.HARISH_BEST_PARAMS, random_state=42, verbose=-1, deterministic=True, force_row_wise=True)
-        threshold_model = CalibratedClassifierCV(estimator=model, method='isotonic', cv=5)
-        threshold_model.fit(train_encoded, train_target)
-        probabilities = threshold_model.predict_proba(val_encoded)[:, 1]
-        threshold = self._select_decision_threshold(val_target, probabilities)
+        baseline_model = CalibratedClassifierCV(
+            estimator=LGBMClassifier(
+                **self.HARISH_BEST_PARAMS,
+                random_state=42,
+                verbose=-1,
+                deterministic=True,
+                force_row_wise=True,
+            ),
+            method='isotonic',
+            cv=3,
+        )
+        baseline_model.fit(train_encoded, train_target)
+        baseline_validation_probability = self._apply_underwriting_policy_layer(
+            val_data, baseline_model.predict_proba(val_encoded)[:, 1]
+        )
+        baseline_threshold = self._select_decision_threshold(
+            val_target, baseline_validation_probability
+        )
+        baseline_validation_prediction = (
+            baseline_validation_probability >= baseline_threshold
+        ).astype(int)
+        baseline_validation_fp = int(
+            ((baseline_validation_prediction == 1) & (val_target.to_numpy() == 0)).sum()
+        )
+
+        candidate_results = []
+        for variant in self.MODEL_PARAMETER_VARIANTS:
+            candidate_params = dict(self.HARISH_BEST_PARAMS)
+            candidate_params.update(variant)
+            if not variant:
+                candidate_model = baseline_model
+                validation_probability = baseline_validation_probability
+            else:
+                candidate_model = CalibratedClassifierCV(
+                    estimator=LGBMClassifier(
+                        **candidate_params,
+                        random_state=42,
+                        verbose=-1,
+                        deterministic=True,
+                        force_row_wise=True,
+                    ),
+                    method='isotonic',
+                    cv=3,
+                )
+                candidate_model.fit(train_encoded, train_target)
+                validation_probability = self._apply_underwriting_policy_layer(
+                    val_data, candidate_model.predict_proba(val_encoded)[:, 1]
+                )
+
+            candidate_threshold = self._select_threshold_with_fp_cap(
+                val_target, validation_probability, baseline_validation_fp
+            )
+            candidate_prediction = (validation_probability >= candidate_threshold).astype(int)
+            candidate_fp = int(
+                ((candidate_prediction == 1) & (val_target.to_numpy() == 0)).sum()
+            )
+            candidate_results.append({
+                'model': candidate_model,
+                'params': candidate_params,
+                'probabilities': validation_probability,
+                'threshold': candidate_threshold,
+                'false_positives': candidate_fp,
+                'recall': float(recall_score(val_target, candidate_prediction, zero_division=0)),
+                'precision': float(precision_score(val_target, candidate_prediction, zero_division=0)),
+                'auc': float(roc_auc_score(val_target, validation_probability)),
+            })
+
+        selected_candidate = max(
+            candidate_results,
+            key=lambda candidate: (
+                candidate['recall'],
+                candidate['auc'],
+                -candidate['false_positives'],
+                candidate['precision'],
+            ),
+        )
+        selected_params = selected_candidate['params']
+        validation_probability = selected_candidate['probabilities']
+        validation_threshold = selected_candidate['threshold']
+        threshold = validation_threshold
+        selected_validation_fp = selected_candidate['false_positives']
+        threshold_model = selected_candidate['model']
+
+        baseline_test_probability = self._apply_underwriting_policy_layer(
+            test_data, baseline_model.predict_proba(test_encoded)[:, 1]
+        )
+        baseline_test_prediction = (baseline_test_probability >= baseline_threshold).astype(int)
+        baseline_test_fp = int(
+            ((baseline_test_prediction == 1) & (test_target.to_numpy() == 0)).sum()
+        )
+        baseline_test_fn = int(
+            ((baseline_test_prediction == 0) & (test_target.to_numpy() == 1)).sum()
+        )
 
         final_train = pd.concat([train_encoded, val_encoded], ignore_index=True)
         final_target = pd.concat([train_target, val_target], ignore_index=True)
-        final_model = CalibratedClassifierCV(
-            estimator=LGBMClassifier(**self.HARISH_BEST_PARAMS, random_state=42, verbose=-1, deterministic=True, force_row_wise=True),
-            method='isotonic', cv=5,
+        final_model = selected_candidate['model']
+        test_probability = self._apply_underwriting_policy_layer(
+            test_data, final_model.predict_proba(test_encoded)[:, 1]
         )
-        final_model.fit(final_train, final_target)
-        auc = float(roc_auc_score(test_target, final_model.predict_proba(test_encoded)[:, 1]))
+        auc = float(roc_auc_score(test_target, test_probability))
+        test_prediction = (test_probability >= threshold).astype(int)
+        test_fp = int(((test_prediction == 1) & (test_target.to_numpy() == 0)).sum())
+        test_fn = int(((test_prediction == 0) & (test_target.to_numpy() == 1)).sum())
+        internal_test_metrics = {
+            'baseline_false_positives': baseline_test_fp,
+            'baseline_false_negatives': baseline_test_fn,
+            'selected_false_positives': test_fp,
+            'selected_false_negatives': test_fn,
+            'selected_roc_auc': auc,
+        }
 
         dpd_train_target = pd.to_numeric(train_data['Longest_DPD'], errors='coerce').fillna(0).clip(lower=0).reset_index(drop=True)
         dpd_val_target = pd.to_numeric(val_data['Longest_DPD'], errors='coerce').fillna(0).clip(lower=0).reset_index(drop=True)
         dpd_params = {
-            key: value for key, value in self.HARISH_BEST_PARAMS.items()
+            key: value for key, value in selected_params.items()
             if key != 'scale_pos_weight'
         }
         positive_train = dpd_train_target > 1
@@ -903,7 +1106,6 @@ class AIModel:
             force_row_wise=True,
         )
         dpd_model.fit(train_encoded.loc[positive_train], np.log1p(dpd_train_target.loc[positive_train]))
-        validation_probability = threshold_model.predict_proba(val_encoded)[:, 1]
         validation_severity = np.clip(np.expm1(dpd_model.predict(val_encoded)), 0.0, 365.0)
         dpd_threshold = threshold
         dpd_validation = np.where(
@@ -939,7 +1141,7 @@ class AIModel:
             [category_train_target, category_val_target], ignore_index=True
         )
         category_params = {
-            key: value for key, value in self.HARISH_BEST_PARAMS.items()
+            key: value for key, value in selected_params.items()
             if key != 'scale_pos_weight'
         }
         category_model = LGBMClassifier(
@@ -970,7 +1172,7 @@ class AIModel:
         self.dpd_model = final_dpd_model
         self.dpd_category_model = final_category_model
         self.rf = final_model
-        self.X_full = final_train.reset_index(drop=True)
+        self.X_full = train_encoded.reset_index(drop=True)
         self.categorical_cols = [c for c in self.CATEGORICAL_COLS if c in self.features]
         self.numeric_cols = [c for c in self.features if c not in self.categorical_cols]
         bundle = {
@@ -991,9 +1193,16 @@ class AIModel:
             'split_thresholds': split_thresholds,
             'dropped_columns': self.dropped_columns,
             'dealer_smooth': getattr(self, 'dealer_smooth', {}),
+            'winsor_limits': self.winsor_limits,
             'dealer_high_cutoff': getattr(self, 'dealer_high_cutoff', 0.0),
             'dealer_mid_cutoff': getattr(self, 'dealer_mid_cutoff', 0.0),
             'dealer_dti_cutoff': getattr(self, 'dealer_dti_cutoff', 0.0),
+            'selected_model_params': selected_params,
+            'baseline_validation_false_positives': baseline_validation_fp,
+            'selected_validation_false_positives': selected_validation_fp,
+            'internal_test_metrics': internal_test_metrics,
+            'split_metadata': split_metadata,
+            'validation_decision_threshold': validation_threshold,
             'decision_threshold': threshold,
             'auc': auc,
             'dpd_validation_mae': dpd_mae,
@@ -1043,6 +1252,37 @@ class AIModel:
         )
         return threshold
 
+    @classmethod
+    def _select_threshold_with_fp_cap(
+        cls,
+        target: pd.Series,
+        probabilities: np.ndarray,
+        max_false_positives: int,
+    ) -> float:
+        """Maximize validation recall without exceeding a false-positive cap."""
+        candidate_thresholds = np.unique(
+            np.concatenate((
+                np.asarray([0.0, 1.0, np.nextafter(1.0, np.inf)]),
+                np.asarray(probabilities, dtype=float),
+            ))
+        )
+        target_values = np.asarray(target, dtype=int)
+        candidates = []
+        for candidate in candidate_thresholds:
+            predicted = (probabilities >= candidate).astype(int)
+            false_positives = int(((predicted == 1) & (target_values == 0)).sum())
+            if false_positives > max_false_positives:
+                continue
+            recall = recall_score(target_values, predicted, zero_division=0)
+            precision = precision_score(target_values, predicted, zero_division=0)
+            candidates.append((recall, -false_positives, precision, float(candidate)))
+
+        if not candidates:
+            return float(np.nextafter(1.0, np.inf))
+
+        _, _, _, threshold = max(candidates)
+        return threshold
+
     def _load_bundle(self, bundle: dict) -> None:
         self.model = bundle.get('model', bundle.get('rf'))
         self.dpd_model = bundle.get('dpd_model')
@@ -1058,6 +1298,7 @@ class AIModel:
         self.medians = pd.Series(bundle.get('medians', {})).reindex(self.features).fillna(0.0)
         self.imputer = bundle.get('imputer')
         self.dealer_smooth = bundle.get('dealer_smooth', {})
+        self.winsor_limits = bundle.get('winsor_limits', {})
         self.dealer_high_cutoff = bundle.get('dealer_high_cutoff', 0.0)
         self.dealer_mid_cutoff = bundle.get('dealer_mid_cutoff', 0.0)
         self.dealer_dti_cutoff = bundle.get('dealer_dti_cutoff', 0.0)
